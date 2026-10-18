@@ -1,0 +1,7 @@
+# Template for app/key.properties
+# Copy to key.properties and fill in real values.
+# DO NOT commit key.properties to the repo.
+storePassword=YOUR_STORE_PASSWORD
+keyPassword=YOUR_KEY_PASSWORD
+keyAlias=xdesk
+storeFile=xdesk-release.keystore

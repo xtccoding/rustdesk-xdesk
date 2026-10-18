@@ -1,0 +1,241 @@
+name: Build Xdesk APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+env:
+  XDESK_VERSION: "1.5.0"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Patch Flutter SDK
+        run: |
+          cd /opt/flutter
+          P="$GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if [ -f "$P" ]; then
+            if git apply --check "$P" 2>/dev/null; then
+              git apply "$P" && echo "flutter patch applied"
+            else
+              echo "flutter patch already applied / not applicable - skip"
+            fi
+          else
+            echo "no patch file, skip"
+          fi
+
+      - name: Provision build toolchain
+        run: |
+          # runner 环境由仓库脚本定义（ci/provision-runner.sh），幂等 + 自愈。
+          # 体检通过则秒过；关键组件缺失时自动安装，不再依赖手工黑箱。
+          chmod +x ci/provision-runner.sh
+          if ! bash ci/provision-runner.sh --check; then
+            echo "::group::环境不完整，自动 provision"
+            bash ci/provision-runner.sh
+            echo "::endgroup::"
+          fi
+
+      - name: Show toolchain
+        run: |
+          source /etc/profile.d/xdesk-build.sh
+          echo "flutter   : $(flutter --version 2>&1 | head -1)"
+          echo "rustc     : $(rustc --version)"
+          echo "cargo-ndk : $(cargo ndk --version 2>&1)"
+          echo "java      : $(java -version 2>&1 | grep -v JAVA_TOOL | head -1)"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "NDK=$ANDROID_NDK_HOME"
+          echo "VCPKG_ROOT=$VCPKG_ROOT"
+          echo "CARGO_HOME=$CARGO_HOME"
+
+      - name: Install bridge generator
+        run: |
+          source /etc/profile.d/xdesk-build.sh
+          if [ ! -x "$CARGO_HOME/bin/flutter_rust_bridge_codegen" ]; then
+            cargo install cargo-expand --version $CARGO_EXPAND_VERSION --locked 2>&1 | tail -3
+            cargo install flutter_rust_bridge_codegen --version $FLUTTER_RUST_BRIDGE_VERSION --features uuid --locked 2>&1 | tail -3
+          else
+            echo "codegen 已安装，跳过"
+          fi
+          ls -la "$CARGO_HOME/bin/" | grep -E "cargo-expand|flutter_rust_bridge_codegen" || true
+
+      - name: Generate flutter-rust-bridge
+        run: |
+          source /etc/profile.d/xdesk-build.sh
+          if [ -f flutter/lib/generated_bridge.dart ] && [ -f src/bridge_generated.rs ]; then
+            echo "bridge 文件已存在，跳过生成"
+          else
+            pushd flutter
+            if ! flutter pub get; then
+              echo "=== pub get 失败，降级 extended_text 后重试 ==="
+              sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' pubspec.yaml
+              flutter pub get
+            fi
+            popd
+            flutter_rust_bridge_codegen \
+              --rust-input ./src/flutter_ffi.rs \
+              --dart-output ./flutter/lib/generated_bridge.dart \
+              --c-output ./flutter/macos/Runner/bridge_generated.h
+            cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+          fi
+          ls -la flutter/lib/generated_bridge.dart src/bridge_generated.rs src/bridge_generated.io.rs
+
+      - name: Build vcpkg dependencies (C++)
+        run: |
+          source /etc/profile.d/xdesk-build.sh
+          if [ -d "$VCPKG_ROOT/installed/arm64-android/lib" ]; then
+            echo "vcpkg arm64-android 已缓存，跳过（$(ls $VCPKG_ROOT/installed/arm64-android/lib | wc -l) 个 lib）"
+          else
+            echo "首次编译 vcpkg 依赖，耗时较长..."
+            ./flutter/build_android_deps.sh arm64-v8a
+          fi
+
+      - name: Build Rust library
+        run: |
+          source /etc/profile.d/xdesk-build.sh
+          if [ ! -d "$RUSTUP_HOME/toolchains/1.75.0-x86_64-unknown-linux-gnu/lib/rustlib/aarch64-linux-android" ]; then
+            rustup target add aarch64-linux-android 2>&1 | tail -1
+          else
+            echo "aarch64-linux-android std 已就绪，跳过 rustup target add"
+          fi
+          rustc --version
+          # 用 ci/build-android-lib.sh 而非上游 flutter/ndk_arm64.sh，差异见该脚本头部：
+          #   --bindgen 给 hwcodec 的 bindgen 提供 Android sysroot（否则报 libc-header-start.h）
+          #   --lib      只编 liblibrustdesk.so，跳过后三个桌面二进制的 fat-LTO 链接（各吃 2GB+）
+          # 显式用 bash 调用：Windows 侧 core.fileMode=false，执行位可能没进 git 索引
+          bash ci/build-android-lib.sh aarch64-linux-android 21
+          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp ./target/aarch64-linux-android/release/liblibrustdesk.so \
+             ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so \
+             ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+          ls -la ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Setup signing
+        run: |
+          SIGN_DIR=/opt/xdesk
+          if [ -f "$SIGN_DIR/xdesk-release.keystore" ] && [ -f "$SIGN_DIR/key.properties" ]; then
+            echo "找到 keystore，使用 release 签名"
+            cp "$SIGN_DIR/xdesk-release.keystore" flutter/android/app/xdesk-release.keystore
+            cp "$SIGN_DIR/key.properties" flutter/android/key.properties
+            echo "--- key.properties ---"
+            cat flutter/android/key.properties
+          else
+            echo "未找到 keystore，回退 debug 签名"
+            sed -i "s/signingConfigs.release/signingConfigs.debug/g" flutter/android/app/build.gradle
+          fi
+
+      - name: Build APK
+        run: |
+          source /etc/profile.d/xdesk-build.sh
+          # 6GB runner：采用本地 WSL 实测后的保守 Gradle 配置，避免 daemon/Kotlin 并发吃满内存。
+          sed -i -E 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8/' flutter/android/gradle.properties
+          grep -q '^org.gradle.jvmargs=' flutter/android/gradle.properties || echo 'org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8' >> flutter/android/gradle.properties
+          grep -q '^org.gradle.daemon=' flutter/android/gradle.properties && sed -i 's/^org.gradle.daemon=.*/org.gradle.daemon=false/' flutter/android/gradle.properties || echo 'org.gradle.daemon=false' >> flutter/android/gradle.properties
+          grep -q '^org.gradle.parallel=' flutter/android/gradle.properties && sed -i 's/^org.gradle.parallel=.*/org.gradle.parallel=false/' flutter/android/gradle.properties || echo 'org.gradle.parallel=false' >> flutter/android/gradle.properties
+          echo 'org.gradle.workers.max=2' >> flutter/android/gradle.properties
+          echo 'kotlin.compiler.execution.strategy=in-process' >> flutter/android/gradle.properties
+          cat flutter/android/gradle.properties
+          pushd flutter
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          popd
+          mkdir -p out
+          cp flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+             out/xdesk-${XDESK_VERSION}-arm64-${{ github.run_number }}.apk
+          ls -lh out/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdesk-apk-${{ github.run_number }}
+          path: out/*.apk
+          retention-days: 30
+
+      # 直接把 APK 发到 Gitea Release，不用再进 Actions 页面翻 artifact。
+      # 同一版本重复构建 → 覆盖同名资产；换版本 → 自动新建 tag + release。
+      - name: Publish to Gitea Release
+        if: success()
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          APK=$(ls -1 out/*.apk 2>/dev/null | head -1)
+          [ -n "$APK" ] || { echo "::error::out/ 下没有 APK，跳过 release"; exit 1; }
+
+          TAG="xdesk-${XDESK_VERSION}"
+          ASSET="xdesk-${XDESK_VERSION}-arm64-v8a.apk"
+          SIZE_H=$(du -h "$APK" | cut -f1)
+          SHA256=$(sha256sum "$APK" | awk '{print $1}')
+
+          API="${GITHUB_API_URL:-http://192.168.31.203:3000/api/v1}"
+          SERVER="${GITHUB_SERVER_URL:-http://192.168.31.203:3000}"
+          REPO="${GITHUB_REPOSITORY:-xtcer/xdesk}"
+          AUTH="Authorization: token ${GITEA_TOKEN}"
+          CURL="curl -sS --retry 3 --retry-delay 2 --max-time 600"
+
+          BODY=$(jq -rn \
+            --arg v "$XDESK_VERSION" --arg run "$GITHUB_RUN_NUMBER" \
+            --arg sha "${GITHUB_SHA:0:7}" --arg size "$SIZE_H" --arg sum "$SHA256" \
+            '"- **版本**：xdesk \($v)（arm64-v8a）\n" +
+             "- **构建**：Gitea Actions run #\($run)，提交 `\($sha)`\n" +
+             "- **体积**：\($size)\n" +
+             "- **SHA256**：`\($sum)`\n\n" +
+             "由自建 runner（6C/6G）低内存参数构建：Gradle -Xmx2g、workers=2、vcpkg 并发 2、Rust jobs=2。\n" +
+             "Android 包名 cn.xtcer.xdesk。\n"')
+
+          # 1) tag 是否已有 release
+          CODE=$($CURL -o /dev/null -w '%{http_code}' -H "$AUTH" "$API/repos/$REPO/releases/tags/$TAG" || echo 000)
+          if [ "$CODE" = "200" ]; then
+            REL_ID=$($CURL -H "$AUTH" "$API/repos/$REPO/releases/tags/$TAG" | jq -r '.id')
+            echo "release 已存在（id=$REL_ID），更新资产与说明"
+            $CURL -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg body "$BODY" '{body:$body}')" \
+              "$API/repos/$REPO/releases/$REL_ID" | jq -r '.id' > /dev/null
+          else
+            echo "release 不存在（HTTP $CODE），创建 $TAG"
+            RESP=$($CURL -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              -d "$(jq -cn \
+                    --arg tag "$TAG" --arg sha "$GITHUB_SHA" \
+                    --arg name "xdesk $XDESK_VERSION" --arg body "$BODY" \
+                    '{tag_name:$tag, target_commitish:$sha, name:$name, body:$body, draft:false, prerelease:false}')" \
+              "$API/repos/$REPO/releases")
+            REL_ID=$(echo "$RESP" | jq -r '.id // empty')
+            if [ -z "$REL_ID" ]; then
+              echo "::error::创建 release 失败：$(echo "$RESP" | jq -c . 2>/dev/null || echo "$RESP")"
+              exit 1
+            fi
+          fi
+
+          # 2) 删掉同名旧资产，保证 Releases 页始终只有一份最新 APK
+          for AID in $($CURL -H "$AUTH" "$API/repos/$REPO/releases/$REL_ID/assets" \
+                        | jq -r --arg n "$ASSET" '.[] | select(.name==$n) | .id'); do
+            echo "删除旧资产 id=$AID"
+            $CURL -X DELETE -H "$AUTH" "$API/repos/$REPO/releases/$REL_ID/assets/$AID" > /dev/null
+          done
+
+          # 3) 上传
+          echo "上传 $ASSET（$SIZE_H）…"
+          UP=$($CURL -X POST -H "$AUTH" \
+                -H "Content-Type: application/vnd.android.package-archive" \
+                --data-binary "@$APK" \
+                "$API/repos/$REPO/releases/$REL_ID/assets?name=$ASSET")
+          echo "$UP" | jq -r '"资产上传结果: id=\(.id) name=\(.name) size=\(.size)"'
+
+          echo "=================================================="
+          echo "Release: $SERVER/$REPO/releases/tag/$TAG"
+          echo "下载:    $SERVER/$REPO/releases/download/$TAG/$ASSET"
+          echo "=================================================="

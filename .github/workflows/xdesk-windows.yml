@@ -1,0 +1,179 @@
+name: xdesk Windows x64
+
+# 只构建 Windows x86_64（flutter 桌面版），产物是可运行的 rustdesk 目录。
+# 上游 flutter-build.yml 是 workflow_call 型（被 flutter-tag/nightly 调用），
+# 这里把它里面 build-for-windows-flutter 的 x86_64 分支抽出来，做成可手动触发的独立工作流。
+# 不签名、不打 MSI、不发布 Release —— 那些需要 secrets 和 tag，本项目用不上。
+
+on:
+  workflow_dispatch:
+
+env:
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.5.0"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-topmostwindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  build-windows-x64:
+    needs: [generate-bridge, build-topmostwindow]
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685
+      - name: Replace engine with rustdesk custom flutter engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+
+          # subosito 的安装根目录不固定（Windows 上是 ...\stable-<ver>-x64），
+          # 不能像上游那样写死 C:/hostedtoolcache/...，从 flutter 命令反推。
+          $root = Split-Path (Split-Path (Get-Command flutter).Source)
+          $engine = Join-Path $root "bin\cache\artifacts\engine\windows-x64-release"
+          Write-Host "flutter root : $root"
+          Write-Host "engine target: $engine"
+
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release -Force
+
+          # 解压出来如果只有一层同名目录，就用它当源
+          $src = Join-Path $PWD "windows-x64-release"
+          $items = Get-ChildItem $src
+          if ($items.Count -eq 1 -and $items[0].PSIsContainer) { $src = $items[0].FullName }
+          Write-Host "engine source: $src"
+          Get-ChildItem $src | Select-Object -First 10 Name
+
+          # precache 在 3.24.5 上不一定创建 windows-x64-release，显式建目录再覆盖
+          New-Item -ItemType Directory -Force -Path $engine | Out-Null
+          Copy-Item -Path (Join-Path $src '*') -Destination $engine -Recurse -Force
+          Get-ChildItem $engine | Select-Object -First 10 Name
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-2022-x64
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-x64-windows-static-rel-out.log" || true
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found";
+          else
+            echo "Runner.res: $runner_res";
+            cp $runner_res ./libs/portable/Runner.res;
+            ls -l ./libs/portable/Runner.res;
+          fi
+
+      - name: Show output
+        shell: bash
+        run: |
+          ls -lh ./rustdesk | head -30
+          du -sh ./rustdesk
+
+      - name: Upload rustdesk (unsigned, portable dir)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-x86_64
+          path: rustdesk
+          retention-days: 14
