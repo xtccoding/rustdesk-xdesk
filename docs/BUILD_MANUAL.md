@@ -106,3 +106,72 @@ git merge upstream/master                              # 或者只 cherry-pick �
 ```
 
 冲突大概率集中在 `libs/hbb_common/src/config.rs`、`src/common.rs`、`flutter/` 下的品牌相关行。
+
+---
+
+## 六、MSI 和 deb 是怎么打出来的
+
+这两个包的是同一份已经编译好的程序，区别只在"用哪个工具把文件塞进容器"。
+本仓库的 `xdesk Windows x64` 工作流**只产出绿色版目录**（artifact 里的 `rustdesk/`），
+下面两种是上游的官方打包方式，需要的话可以加进工作流。
+
+### MSI（Windows 安装包）
+
+用 **WiX v4**（微软官方的 MSI 编译器），工程在 `res/msi/`：
+
+```
+res/msi/
+  msi.sln                  Visual Studio 解决方案
+  Package/Package.wxs      MSI 主定义：产品名、升级码、安装流程
+  Package/Includes.wxi     变量区（版本号、厂商、安装目录），由脚本填
+  Package/Components/      "每个文件一个 component" 的清单，由脚本生成
+  Package/Fragments/       升级规则、ARP（控制面板里的卸载项）属性
+  Package/UI/              安装向导界面
+  CustomActions/           C++ 写的自定义动作 DLL
+  preprocess.py            生成上面这些 .wxs/.wxi 的脚本
+```
+
+流程：
+
+1. `python preprocess.py -d <绿色版目录> --app-name ...`
+   扫描绿色版目录里每个文件，生成 WiX 的 `Component` 清单（相当于 WiX 官方的 heat），
+   同时把版本号、产品名、升级 GUID、ARP 信息写进 `Includes.wxi` / `Fragments/`。
+   **它是在原地改写 `res/msi` 下的文件**，所以 CI 打完要 `git checkout -- res/msi` 还原。
+2. `nuget restore msi.sln` 拉 WiX 的 NuGet 包（不用单独装 WiX，msbuild 直接从 NuGet 取）。
+3. `msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10`
+   产出 `Package/bin/x64/Release/en-us/Package.msi`。
+4. `CustomActions` 这个 C++ DLL 干 MSI 本身做不到的事：装 Windows 服务、加防火墙规则、
+   读配置、装远程打印机驱动。它在 MSI 里作为立即/延迟执行的自定义动作被调用。
+
+CI 里还会多跑一遍，把 exe 名和应用名换成占位符（`RDAPPNAM.exe`），产出一个"MSI 模板"。
+那是上游发版流程用的：以后换品牌名只改模板里的属性，不用重新编译整个 MSI。
+
+### deb（Debian / Ubuntu 安装包）
+
+用 **`dpkg-deb`**，不需要额外工具链，脚本是根目录 `build.py` 的 `build_flutter_deb()`：
+
+1. `flutter build linux --release` → 得到 `flutter/build/linux/x64/release/bundle/`
+2. 在 `flutter/tmpdeb/` 里搭一个假的根目录，按 FHS 摆放：
+
+| 包内路径 | 内容 |
+|---|---|
+| `usr/share/rustdesk/` | 整个 bundle（可执行文件、`data/`、`lib/`） |
+| `usr/bin/rustdesk` | 软链到 `/usr/share/rustdesk/rustdesk` |
+| `usr/share/applications/` | `rustdesk.desktop`、`rustdesk-link.desktop` |
+| `usr/share/icons/hicolor/` | 256x256 png + scalable svg |
+| `usr/share/rustdesk/files/systemd/` | `rustdesk.service` |
+| `usr/share/polkit-1/actions/` | polkit 授权策略 |
+
+3. `generate_control_file()` 写出 `DEBIAN/control`（包名、版本、架构、依赖列表），
+   再 `cp -a res/DEBIAN/*` 把 `preinst / postinst / prerm / postrm` 四个维护脚本放进去
+   —— 装服务、建用户、升级时停旧服务全靠这四个脚本。
+4. `md5_file_folder()` 生成 `DEBIAN/md5sums`。
+5. `dpkg-deb -b tmpdeb rustdesk.deb` → 标准 deb，`apt install ./rustdesk.deb` 就能装。
+
+架构由 `DEB_ARCH` 环境变量控制（amd64 / arm64），CI 里按 matrix 传入。
+
+### 想给这个 fork 也加上
+
+- MSI：在 `xdesk-windows.yml` 的 `build-windows-x64` 之后加一步 `pushd res/msi` + `nuget restore` + `msbuild`。
+  windows-2022 runner 自带 nuget 和 msbuild，不用额外装。产品名/厂商改 `preprocess.py` 的参数。
+- deb：新增一个 `ubuntu-22.04` 任务跑 `python3 build.py --flutter --skip-cargo`，产物 `rustdesk-<version>.deb`。
