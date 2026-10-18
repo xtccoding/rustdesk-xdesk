@@ -1,0 +1,86 @@
+name: xdesk Linux deb
+
+# 只做 Debian/Ubuntu 的 .deb，手动触发。
+# 用的是上游 build.py 的 build_flutter_deb()：flutter build linux → 搭 tmpdeb 目录树 → dpkg-deb -b。
+# 不开 hwcodec / vram（那两个要 vcpkg 编 ffmpeg，deb 用不上），所以不需要 vcpkg。
+# 首次跑约 40–70 分钟，主要耗在 cargo 编译和 flutter linux 引擎下载。
+
+on:
+  workflow_dispatch:
+
+env:
+  SCITER_RUST_VERSION: "1.75"
+  FLUTTER_VERSION: "3.24.5"
+  VERSION: "1.5.0"
+  DEB_ARCH: "amd64"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-deb:
+    needs: [generate-bridge]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential clang cmake curl gcc g++ git ninja-build pkg-config \
+            libayatana-appindicator3-dev libasound2-dev libclang-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev libpulse-dev libva-dev \
+            libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxdo-dev libxfixes-dev libssl-dev \
+            nasm unzip wget xz-utils rpm
+          # 我们自己编 libopus，系统包会和它冲突
+          sudo apt-get remove -y libopus-dev || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: linux-deb-x64
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Enable Linux desktop
+        run: |
+          flutter config --enable-linux-desktop
+          flutter --version
+
+      - name: Build deb
+        run: |
+          # 不需要 cargo 再跑一遍时可以用 --skip-cargo，这里让它完整编
+          python3 ./build.py --flutter
+          ls -lh ./*.deb
+          dpkg-deb -I ./*.deb | head -30
+          dpkg-deb -c ./*.deb | head -20
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdesk-deb-amd64
+          path: ./*.deb
+          retention-days: 14

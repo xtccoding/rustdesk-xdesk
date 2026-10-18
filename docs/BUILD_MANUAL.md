@@ -170,8 +170,12 @@ CI 里还会多跑一遍，把 exe 名和应用名换成占位符（`RDAPPNAM.ex
 
 架构由 `DEB_ARCH` 环境变量控制（amd64 / arm64），CI 里按 matrix 传入。
 
-### 想给这个 fork 也加上
+### 本仓库已接上这两个包
 
-- MSI：在 `xdesk-windows.yml` 的 `build-windows-x64` 之后加一步 `pushd res/msi` + `nuget restore` + `msbuild`。
-  windows-2022 runner 自带 nuget 和 msbuild，不用额外装。产品名/厂商改 `preprocess.py` 的参数。
-- deb：新增一个 `ubuntu-22.04` 任务跑 `python3 build.py --flutter --skip-cargo`，产物 `rustdesk-<version>.deb`。
+- MSI：在 `xdesk-windows.yml` 的 `build-windows-x64` 里，编译完会先把 `rustdesk.exe` 改名成 `Xdesk.exe`
+  （`preprocess.py` 要用 `<app-name>.exe` 跑 `--build-date` 读构建时间），再 `python preprocess.py --app-name Xdesk`
+  → `nuget restore` → `msbuild`，产物 `msi/xdesk-1.5.0-x86_64.msi`。
+- deb：单独的 `xdesk-linux-deb.yml`，手动触发，跑 `python3 build.py --flutter`，产物 `xdesk-deb-amd64`。
+  不开 `--hwcodec` / `--vram`，所以不需要 vcpkg。
+
+两个工作流都是 `workflow_dispatch`，不会因为 push 自动跑。

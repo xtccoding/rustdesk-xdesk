@@ -171,6 +171,42 @@ jobs:
           ls -lh ./rustdesk | head -30
           du -sh ./rustdesk
 
+      - name: Rename app exe for MSI branding
+        # res/msi/preprocess.py 会用 dist 目录里的 <app-name>.exe 去跑 --build-date，
+        # 所以 --app-name Xdesk 时文件名必须先是 Xdesk.exe。
+        shell: pwsh
+        run: |
+          Move-Item ./rustdesk/rustdesk.exe ./rustdesk/Xdesk.exe
+          Get-Item ./rustdesk/Xdesk.exe | Select-Object Name, Length
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build MSI
+        # WiX v4（NuGet 上的 WixToolset.Sdk）+ 原生 CustomActions。
+        # preprocess.py 会原地改写 res/msi 下的 .wxs/.wxi，所以打完要 checkout 还原。
+        shell: pwsh
+        run: |
+          pushd ./res/msi
+          python preprocess.py -d ../../rustdesk --app-name Xdesk -v ${{ env.VERSION }}
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path ../../msi | Out-Null
+          Move-Item $msi.FullName ../../msi/xdesk-${{ env.VERSION }}-x86_64.msi
+          popd
+          Get-FileHash ./msi/*.msi -Algorithm SHA256
+          git checkout -- res/msi
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdesk-msi-x86_64
+          path: msi/*.msi
+          retention-days: 14
+
       - name: Upload rustdesk (unsigned, portable dir)
         uses: actions/upload-artifact@v4
         with:
